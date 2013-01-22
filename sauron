@@ -1,0 +1,267 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2012, Mauro Rocchi
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without modification, are
+# permitted provided that the following conditions are met:
+#
+# Redistributions of source code must retain the above copyright notice, this list of
+# conditions and the following disclaimer.
+# Redistributions in binary form must reproduce the above copyright notice, this list of
+# conditions and the following disclaimer in the documentation and/or other materials
+# provided with the distribution.
+# Neither the name of the organization nor the names of its contributors may be used to
+# endorse or promote products derived from this software without specific prior written
+# permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+# SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
+# OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import itertools
+import os
+from optparse import OptionParser
+import re
+import sys
+from threading import Lock, Thread
+import time
+
+
+#########################################################################################
+# Functional support
+#########################################################################################
+
+def apply(function, *pargs, **pkwargs):
+    """
+    Returns a partial applied function with the given arguments.
+    """
+
+    def partial_applied_function(*args, **kwargs):
+        return function(*(pargs + args), **dict(pkwargs, **kwargs))
+
+    return partial_applied_function
+
+
+#########################################################################################
+# File system
+#########################################################################################
+
+def walk_folder(root):
+    """
+    Yields all files found recursively from the root folder.
+
+    root -- A folder name
+    """
+    for parent, dirnames, filenames in os.walk(root):
+        for filename in filenames:
+            fullname = os.path.join(parent, filename)
+            yield fullname
+        for dirname in dirnames:
+            for sub_filename in walk_folder(os.path.join(parent, dirname)):
+                yield os.path.join(parent, sub_filename)
+
+
+def walk_folders(roots):
+    """
+    Yields all files found recursively from the root folders.
+
+    roots -- An iterable of folder names
+    """
+    folder_files = map(walk_folder, roots)
+    return itertools.chain(*folder_files)
+
+
+def expand_paths(paths):
+    """
+    Yields all files found recursively from the paths specified.
+
+    paths -- An iterable of file or folder names.
+    """
+    folders = filter(os.path.isdir, paths)
+    files = filter(os.path.isfile, paths)
+    return itertools.chain(files, walk_folders(folders))
+
+
+def follow(file, delay=0.5):
+    """
+    Generator that yields the lines added to the file.
+
+    Based on http://code.google.com/p/pytailer.
+    """
+    trailing = True
+    while True:
+        where = file.tell()
+        line = file.readline()
+        if line:
+            if trailing and line in follow.LINE_TERMINATORS:
+                # This is just the line terminator added to the end of the file
+                # before a new line, ignore.
+                trailing = False
+                continue
+            if line[-1] in follow.LINE_TERMINATORS:
+                line = line[:-1]
+                if line[-1:] == '\r\n' and '\r\n' in follow.LINE_TERMINATORS:
+                    # found crlf
+                    line = line[:-1]
+            trailing = False
+            yield line
+        else:
+            trailing = True
+            file.seek(where, 0)
+            time.sleep(delay)
+
+
+follow.LINE_TERMINATORS = ('\r\n', '\n', '\r')
+
+
+#########################################################################################
+# Threading
+#########################################################################################
+
+def synchronized(method):
+    """
+    Decorates the method so that it can be a single execution concorrently.
+    """
+
+    def syncronized_method(*args, **kwargs):
+        lock.acquire()
+        try:
+            return method(*args, **kwargs)
+        finally:
+            lock.release()
+
+    lock = Lock()
+    return syncronized_method
+
+
+def start_daemon_thread(target, args):
+    thread = Thread(target=target, args=args)
+    thread.setDaemon(True)
+    thread.start()
+
+
+#########################################################################################
+# Application
+#########################################################################################
+
+def grep(regex, strings):
+    """
+    Filters all strings that match the regex.
+    """
+    return (text for text in strings if regex.search(text))
+
+
+def polling(provider, seconds):
+    """
+    Perform an action forever, with the intervals of the time specified.
+    Yields the items received from the provider.
+    """
+    while True:
+        for item in provider():
+            yield item
+        time.sleep(seconds)
+
+
+@synchronized
+def emit(source, line):
+    """
+    Prints the line received from the source.
+    """
+    if emit.previous_source != source:
+        print "\n[%s]" % source
+        emit.previous_source = source
+    print line
+
+
+emit.previous_source = ''
+
+
+class FileProvider:
+    """
+    Yields all files found into the specified paths that hold the predicate.
+    Every file is provided only once.
+    """
+
+    def __init__(self, paths, predicate, seek_to_end):
+        self.paths = paths
+        self.predicate = predicate
+        self.seek_to_end = seek_to_end
+        self.history = set()
+
+    def __call__(self):
+        for filename in self._search_all_filenames():
+            try:
+                file = open(filename, 'r')
+                self.history.add(filename)
+                if self.seek_to_end:
+                    file.seek(0, 2)
+                yield file
+            except IOError:
+                print >> sys.stderr, "<!> cannot open file %s" % filename
+        self.seek_to_end = False
+
+    def _search_all_filenames(self):
+        names = expand_paths(self.paths)
+        return filter(lambda name: self.predicate(name) and name not in self.history, names)
+
+
+def sauron(paths, filename_regex, line_regex, seek_to_end, check_interval):
+    """
+    The log monitor.
+    """
+    file_provider = FileProvider(paths, lambda name: filename_regex.search(os.path.basename(name)), seek_to_end)
+    file_poller = polling(file_provider, check_interval)
+    for file in file_poller:
+        if file is None: continue
+        print "observing %s" % file.name
+        lines = grep(line_regex, follow(file))
+        start_daemon_thread(target=map, args=(apply(emit, file.name), lines))
+
+
+def show_version(*args):
+    print "Sauron 0.1"
+    exit()
+
+
+if __name__ == '__main__':
+    WORDS = ', '.join(['error', 'exception', 'fail', 'fails', 'failed', 'failure', 'cannot',
+                       'unable', 'unexpected', 'incorrect', 'invalid', 'bad', 'wrong'])
+
+    parser = OptionParser(usage='usage: %prog [options] [paths (default /var/log)]')
+    parser.add_option('-f', '--files', dest='filename_regex', default=r"log$", action='store',
+                      help="filename regex (default 'log$')")
+    parser.add_option('-a', '--all', dest='seek_to_head', default=False, action='store_true',
+                      help='the log file are followed from the begin')
+    parser.add_option('-w', '--words', dest='words', action='store', default=WORDS,
+                      help="comma-separed words which filters the lines (default: %s)" % WORDS)
+    parser.add_option('-r', '--regex', dest='line_regex', action='store',
+                      help="regex to filter the log lines (it overwrites the --words option)")
+    parser.add_option('-i', '--interval', dest='check_interval', default='1', action='store',
+                      help="interval in seconds before to scan again the paths (default 1)")
+    parser.add_option('--version', action='callback', callback=show_version)
+    (options, args) = parser.parse_args()
+
+    if options.line_regex:
+        line_regex = options.line_regex
+    else:
+        words = map(lambda w: w.strip(), options.words.split(','))
+        line_regex = r"(?i)\b(?:%s)\b" % '|'.join(words)
+
+    try:
+        sauron(
+            paths=len(args) == 0 and ['/var/log'] or args,
+            line_regex=re.compile(line_regex),
+            filename_regex=re.compile(options.filename_regex),
+            seek_to_end=not options.seek_to_head,
+            check_interval=int(options.check_interval)
+        )
+    except KeyboardInterrupt:
+        print "Bye"
+        exit()
